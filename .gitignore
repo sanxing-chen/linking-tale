@@ -1,0 +1,11 @@
+cache*
+spider
+spider.zip
+*.pyc
+.vscode
+vocab
+*.png
+*experiments
+glove.*
+nohup.out
+log*
