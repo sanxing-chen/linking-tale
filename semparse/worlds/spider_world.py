@@ -89,11 +89,10 @@ class SpiderWorld:
 
         return sorted_actions
 
-    def is_global_rule(self, rhs: str) -> bool:
-        rhs = rhs.strip('[] ')
-        if rhs[0] != '"':
-            return True
-        return rhs.strip('"') not in self.entities_names
+    def is_global_rule(self, lhs: str) -> bool:
+        if lhs in ['column_name', 'table_name', 'col_ref', 'table_source']:
+            return False
+        return True
 
     def get_oracle_relevance_score(self, oracle_entities: set):
         """
@@ -120,12 +119,10 @@ class SpiderWorld:
             # default is padding
             mapping[action_index] = -1
 
-            action = action.split(" -> ")[1].strip('[]')
-            action_stripped = action.strip('\"')
-            if action[0] != '"' or action_stripped not in self.entities_names:
+            lhs, rhs = action.split(" -> ")
+            if self.is_global_rule(lhs):
                 continue
-
-            mapping[action_index] = self.entities_names[action_stripped]
+            mapping[action_index] = self.entities_names[rhs.strip('[] "')]
 
         return mapping
 

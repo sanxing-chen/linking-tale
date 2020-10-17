@@ -3,13 +3,14 @@ from typing import Dict, Tuple, List, Set, Any, Callable, Optional
 
 import torch
 from allennlp.modules import Attention, FeedForward
+from allennlp.modules.attention import AdditiveAttention, DotProductAttention
 from allennlp.nn import Activation, util
 
 from allennlp.state_machines.states.grammar_based_state import GrammarBasedState
 from allennlp.state_machines.transition_functions import BasicTransitionFunction
 from allennlp.state_machines.transition_functions.linking_transition_function import LinkingTransitionFunction
 from overrides import overrides
-from torch.nn import Linear
+from torch.nn import Linear, Dropout
 
 from state_machines.states.rnn_statelet import RnnStatelet
 
@@ -21,6 +22,7 @@ class AttendPastSchemaItemsTransitionFunction(BasicTransitionFunction):
                  input_attention: Attention,
                  past_attention: Attention,
                  activation: Activation = Activation.by_name('relu')(),
+                 enable_gating: bool = True, 
                  predict_start_type_separately: bool = True,
                  num_start_types: int = None,
                  add_action_bias: bool = True,
@@ -29,27 +31,29 @@ class AttendPastSchemaItemsTransitionFunction(BasicTransitionFunction):
         super().__init__(encoder_output_dim=encoder_output_dim,
                          action_embedding_dim=action_embedding_dim,
                          input_attention=input_attention,
-                         num_start_types=num_start_types,
                          activation=activation,
-                         predict_start_type_separately=predict_start_type_separately,
                          add_action_bias=add_action_bias,
                          dropout=dropout,
                          num_layers=num_layers)
 
-        self._past_attention = past_attention
+        self.enable_gating = enable_gating
+        self._decoder_dim = encoder_output_dim
+        self._input_projection_layer = Linear(encoder_output_dim + action_embedding_dim, encoder_output_dim)
+
+        if add_action_bias:
+            action_embedding_dim = action_embedding_dim + 1
+        self._past_attention = AdditiveAttention(action_embedding_dim, action_embedding_dim, True)
+        self._past_copy_attention = AdditiveAttention(action_embedding_dim, action_embedding_dim, False)
+        self._action2gate = Linear(action_embedding_dim, 1)
+        self._action2copygate = Linear(action_embedding_dim, 1)
         self._ent2ent_ff = FeedForward(1, 1, 1, Activation.by_name('linear')())
+        self._large_dropout = Dropout(0.3)
 
     @overrides
     def take_step(self,
                   state: GrammarBasedState,
                   max_actions: int = None,
                   allowed_actions: List[Set[int]] = None) -> List[GrammarBasedState]:
-        if self._predict_start_type_separately and not state.action_history[0]:
-            # The wikitables parser did something different when predicting the start type, which
-            # is our first action.  So in this case we break out into a different function.  We'll
-            # ignore max_actions on our first step, assuming there aren't that many start types.
-            return self._take_first_step(state, allowed_actions)
-
         # Taking a step in the decoder consists of three main parts.  First, we'll construct the
         # input to the decoder and update the decoder's hidden state.  Second, we'll use this new
         # hidden state (and maybe other information) to predict an action.  Finally, we will
@@ -61,8 +65,10 @@ class AttendPastSchemaItemsTransitionFunction(BasicTransitionFunction):
         batch_results = self._compute_action_probabilities(state,
                                                            updated_state['hidden_state'],
                                                            updated_state['attention_weights'],
+                                                           updated_state['attended_question'],
                                                            updated_state['past_schema_items_attention_weights'],
-                                                           updated_state['predicted_action_embeddings'])
+                                                           updated_state['predicted_action_embeddings'],
+                                                           updated_state['predicted_type_embeddings'])
         new_states = self._construct_next_states(state,
                                                  updated_state,
                                                  batch_results,
@@ -97,9 +103,9 @@ class AttendPastSchemaItemsTransitionFunction(BasicTransitionFunction):
                                                                 (hidden_state, memory_cell))
         else:
             hidden_state, memory_cell = self._decoder_cell(decoder_input, (hidden_state, memory_cell))
-        hidden_state = self._dropout(hidden_state)
+        hidden_state = self._large_dropout(hidden_state)
 
-        # (group_size, encoder_output_dim)
+        # (group_size, num_question_tokens, encoder_output_dim)
         encoder_outputs = torch.stack([state.rnn_state[0].encoder_outputs[i] for i in state.batch_indices])
         encoder_output_mask = torch.stack([state.rnn_state[0].encoder_output_mask[i] for i in state.batch_indices])
 
@@ -112,30 +118,33 @@ class AttendPastSchemaItemsTransitionFunction(BasicTransitionFunction):
             attended_question, attention_weights = self.attend_on_question(hidden_state,
                                                                            encoder_outputs,
                                                                            encoder_output_mask)
+            # (group_size, encoder_output_dim*2)
             action_query = torch.cat([hidden_state, attended_question], dim=-1)
-
-        # TODO: Can batch this (need to save ids of states with saved outputs)
-        past_schema_items_attention_weights = []
-        for i, rnn_state in enumerate(state.rnn_state):
-            if rnn_state.decoder_outputs is not None:
-                decoder_outputs_states, decoder_outputs_ids = rnn_state.decoder_outputs
-                attn_weights = self.attend(self._past_attention, hidden_state[i].unsqueeze(0),
-                                           decoder_outputs_states.unsqueeze(0), None).squeeze(0)
-                past_schema_items_attention_weights.append((attn_weights, decoder_outputs_ids))
-            else:
-                past_schema_items_attention_weights.append(None)
-
-        # past_schema_items_attention_weights = torch.stack(past_schema_items_attention_weights)
 
         # (group_size, action_embedding_dim)
         projected_query = self._activation(self._output_projection_layer(action_query))
         predicted_action_embeddings = self._dropout(projected_query)
+        predicted_type_embeddings = None
         if self._add_action_bias:
             # NOTE: It's important that this happens right before the dot product with the action
             # embeddings.  Otherwise this isn't a proper bias.  We do it here instead of right next
             # to the `.mm` below just so we only do it once for the whole group.
             ones = predicted_action_embeddings.new([[1] for _ in range(group_size)])
             predicted_action_embeddings = torch.cat([predicted_action_embeddings, ones], dim=-1)
+
+        # TODO: Can batch this (need to save ids of states with saved outputs)
+        past_schema_items_attention_weights = []
+        for i, rnn_state in enumerate(state.rnn_state):
+            if rnn_state.decoder_outputs is not None:
+                decoder_outputs_states, decoder_outputs_ids, prev_action_embeddings = rnn_state.decoder_outputs
+                attn_weights = self.attend(self._past_attention, predicted_action_embeddings[i].unsqueeze(0),
+                                           prev_action_embeddings.unsqueeze(0), None).squeeze(0)
+                copy_attn_weights = self.attend(self._past_copy_attention, predicted_action_embeddings[i].unsqueeze(0),
+                                           prev_action_embeddings.unsqueeze(0), None).squeeze(0)/5.0
+                past_schema_items_attention_weights.append((attn_weights, copy_attn_weights, decoder_outputs_ids, decoder_outputs_states))
+            else:
+                past_schema_items_attention_weights.append(None)
+
         return {
                 'hidden_state': hidden_state,
                 'memory_cell': memory_cell,
@@ -143,6 +152,7 @@ class AttendPastSchemaItemsTransitionFunction(BasicTransitionFunction):
                 'attention_weights': attention_weights,
                 'past_schema_items_attention_weights': past_schema_items_attention_weights,
                 'predicted_action_embeddings': predicted_action_embeddings,
+                'predicted_type_embeddings': predicted_type_embeddings,
                 }
 
     @overrides
@@ -150,8 +160,10 @@ class AttendPastSchemaItemsTransitionFunction(BasicTransitionFunction):
                                       state: GrammarBasedState,
                                       hidden_state: torch.Tensor,
                                       attention_weights: torch.Tensor,
+                                      attended_question: torch.Tensor,
                                       past_schema_items_attention_weights: torch.Tensor,
-                                      predicted_action_embeddings: torch.Tensor
+                                      predicted_action_embeddings: torch.Tensor,
+                                      predicted_type_embeddings: torch.Tensor,
                                       ) -> Dict[int, List[Tuple[int, Any, Any, Any, List[int]]]]:
         # In this section we take our predicted action embedding and compare it to the available
         # actions in our current state (which might be different for each group element).  For
@@ -175,6 +187,8 @@ class AttendPastSchemaItemsTransitionFunction(BasicTransitionFunction):
             current_log_probs = None
             linked_action_logits_encoder = None
             linked_action_ent2ent_logits = None
+            gate = None
+            attended_decoder = attended_question[group_index]
 
             if 'global' in instance_actions:
                 action_embeddings, output_action_embeddings, embedded_actions = instance_actions['global']
@@ -188,25 +202,55 @@ class AttendPastSchemaItemsTransitionFunction(BasicTransitionFunction):
                 action_ids = embedded_actions + linked_actions
                 # (num_question_tokens, 1)
 
+                linked_action_logits_encoder = linking_scores.mm(attention_weights[group_index].unsqueeze(-1)).squeeze(-1)
+                valid_schema_items_ids = [state.action_entity_mapping[batch_id][a] for a in linked_actions]
+
                 # for linked actions, in addition to the linking score with the attended question word, we add
                 # a linking score with an attended previously decoded linked action
                 # num_decoded_entities = 3
-                if past_schema_items_attention_weights[group_index] is not None:
-                    past_items_attention_weights, past_items_action_ids = past_schema_items_attention_weights[group_index]
-                    past_schema_items_ids = [state.action_entity_mapping[batch_id][a]
-                                             for a in past_items_action_ids]
+                has_past_items = past_schema_items_attention_weights[group_index] is not None
+                if has_past_items:
+                    past_items_attention_weights, past_items_copy_weights, past_items_action_ids, decoder_outputs_states = past_schema_items_attention_weights[group_index]
+                    past_schema_items_ids = [state.action_entity_mapping[batch_id][a] for a in past_items_action_ids]
 
                     # we are only interested about the scores of the entities the decoder has already output
                     past_entity_linking_scores = entity_action_linking_scores[:, past_schema_items_ids]
 
                     linked_action_ent2ent_logits = past_entity_linking_scores.mm(
                         past_items_attention_weights.unsqueeze(-1)).squeeze(-1)
-                    linked_action_ent2ent_logits = self._ent2ent_ff(linked_action_ent2ent_logits.unsqueeze(-1)).squeeze(1)
+
+                    if self.enable_gating:
+                        copy_gate = self._action2copygate(predicted_action_embedding)
+                        copy_gate = torch.sigmoid(copy_gate)
+                        # if state.extras is not None and state.extras <= 3:
+                        #     copy_gate = torch.ones_like(copy_gate) * 0.5
+                        copy_weights = torch.stack([past_items_copy_weights[past_items_action_ids.index(i)]
+                            if i in past_items_action_ids
+                            else torch.zeros_like(past_items_copy_weights[0])
+                            for i in linked_actions])
+                        linked_action_ent2ent_logits = copy_gate * torch.softmax(copy_weights, dim=-1) + (1-copy_gate) * torch.softmax(linked_action_ent2ent_logits, dim=-1)
+                    else:
+                        linked_action_ent2ent_logits = self._ent2ent_ff(linked_action_ent2ent_logits.unsqueeze(-1)).squeeze(-1)
                 else:
                     linked_action_ent2ent_logits = 0
 
-                linked_action_logits_encoder = linking_scores.mm(attention_weights[group_index].unsqueeze(-1)).squeeze(-1)
-                linked_action_logits = linked_action_logits_encoder + linked_action_ent2ent_logits
+                if self.enable_gating:
+                    linked_action_logits_encoder = torch.softmax(linked_action_logits_encoder, dim=-1)
+                    gate = torch.sigmoid(self._action2gate(predicted_action_embedding))
+                    if has_past_items:
+                        if state.extras is not None and state.extras <= 3:
+                            gate = torch.ones_like(gate) * 0.333
+                        linked_action_logits = gate * linked_action_logits_encoder + \
+                            (1-gate) * linked_action_ent2ent_logits
+                    else:
+                        gate = torch.ones_like(gate)
+                        linked_action_logits = linked_action_logits_encoder
+                else:
+                    linked_action_logits = linked_action_logits_encoder + linked_action_ent2ent_logits
+
+                if self.enable_gating and not self._past_attention.training and has_past_items:
+                    gate = (torch.stack((gate, (1-gate)*copy_gate, (1-gate)*(1-copy_gate))), torch.argmax(past_items_attention_weights)-past_items_attention_weights.size(0), torch.max(past_items_attention_weights), \
+                        valid_schema_items_ids[past_entity_linking_scores[:, torch.argmax(past_items_attention_weights)].argmax()])
 
                 # The `output_action_embeddings` tensor gets used later as the input to the next
                 # decoder step.  For linked actions, we don't have any action embedding, so we use
@@ -216,11 +260,12 @@ class AttendPastSchemaItemsTransitionFunction(BasicTransitionFunction):
                 else:
                     output_action_embeddings = type_embeddings
 
-                if embedded_action_logits is not None:
-                    action_logits = torch.cat([embedded_action_logits, linked_action_logits], dim=-1)
+                action_logits = linked_action_logits
+
+                if self.enable_gating:
+                    current_log_probs = torch.log(action_logits + 1e-12)
                 else:
-                    action_logits = linked_action_logits
-                current_log_probs = torch.nn.functional.log_softmax(action_logits, dim=-1)
+                    current_log_probs = torch.nn.functional.log_softmax(action_logits, dim=-1)
             elif not instance_actions:
                 action_ids = None
                 current_log_probs = float('inf')
@@ -238,7 +283,9 @@ class AttendPastSchemaItemsTransitionFunction(BasicTransitionFunction):
                                                                     output_action_embeddings,
                                                                     action_ids,
                                                                     linked_action_logits_encoder,
-                                                                    linked_action_ent2ent_logits))
+                                                                    linked_action_ent2ent_logits,
+                                                                    gate,
+                                                                    attended_decoder))
         return batch_results
 
     def _construct_next_states(self,
@@ -270,6 +317,7 @@ class AttendPastSchemaItemsTransitionFunction(BasicTransitionFunction):
                        for x in updated_rnn_state['memory_cell'].chunk(group_size, chunk_index)]
 
         attended_question = [x.squeeze(0) for x in updated_rnn_state['attended_question'].chunk(group_size, 0)]
+        predicted_action_embedding = [x.squeeze(0) for x in updated_rnn_state['predicted_action_embeddings'].chunk(group_size, 0)]
 
         def make_state(group_index: int,
                        action: int,
@@ -281,13 +329,26 @@ class AttendPastSchemaItemsTransitionFunction(BasicTransitionFunction):
             is_linked_action = not state.possible_actions[batch_index][action][1]
             if is_linked_action:
                 if decoder_outputs is None:
-                    decoder_outputs = hidden_state[group_index].unsqueeze(0), [action]
+                    decoder_outputs = hidden_state[group_index].unsqueeze(0), [action], predicted_action_embedding[group_index].unsqueeze(0)
                 else:
-                    decoder_outputs_states, decoder_outputs_ids = decoder_outputs
+                    decoder_outputs_states, decoder_outputs_ids, predicted_action_embeddings = decoder_outputs
                     decoder_outputs = torch.cat((
                         decoder_outputs_states,
                         hidden_state[group_index].unsqueeze(0)
-                    ), dim=0), decoder_outputs_ids + [action]
+                    ), dim=0), decoder_outputs_ids + [action], torch.cat((
+                        predicted_action_embeddings,
+                        predicted_action_embedding[group_index].unsqueeze(0)
+                    ), dim=0)
+
+            for i, _, current_log_probs, _, actions, lsq, lsp, gate, attended_dec in batch_action_probs[batch_index]:
+                if i == group_index:
+                    considered_actions = actions
+                    probabilities = current_log_probs.exp().cpu()
+                    considered_lsq = lsq
+                    considered_lsp = lsp
+                    gate_value = gate
+                    attended_decoder = attended_dec
+                    break
 
             new_rnn_state = RnnStatelet(hidden_state[group_index],
                                         memory_cell[group_index],
@@ -296,13 +357,7 @@ class AttendPastSchemaItemsTransitionFunction(BasicTransitionFunction):
                                         state.rnn_state[group_index].encoder_outputs,
                                         state.rnn_state[group_index].encoder_output_mask,
                                         decoder_outputs)
-            for i, _, current_log_probs, _, actions, lsq, lsp in batch_action_probs[batch_index]:
-                if i == group_index:
-                    considered_actions = actions
-                    probabilities = current_log_probs.exp().cpu()
-                    considered_lsq = lsq
-                    considered_lsp = lsp
-                    break
+
             return state.new_state_from_group_index(group_index,
                                                     action,
                                                     new_score,
@@ -311,7 +366,8 @@ class AttendPastSchemaItemsTransitionFunction(BasicTransitionFunction):
                                                     probabilities,
                                                     updated_rnn_state['attention_weights'],
                                                     considered_lsq,
-                                                    considered_lsp
+                                                    considered_lsp,
+                                                    gate_value
                                                     )
 
         new_states = []
@@ -330,7 +386,7 @@ class AttendPastSchemaItemsTransitionFunction(BasicTransitionFunction):
                 group_log_probs: List[torch.Tensor] = []
                 group_action_embeddings = []
                 group_actions = []
-                for group_index, log_probs, _, action_embeddings, actions, _, _ in results:
+                for group_index, log_probs, _, action_embeddings, actions, _, _, _, _ in results:
                     if not actions:
                         continue
 

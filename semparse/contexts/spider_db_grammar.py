@@ -45,7 +45,7 @@ GRAMMAR_DICTIONARY["where_conj"] = ['(ws "and" wsp expr ws where_conj)', '(ws "a
 
 GRAMMAR_DICTIONARY["groupby_clause"] = ['(ws "group" ws "by" ws group_clause ws "having" ws expr)',
                                         '(ws "group" ws "by" ws group_clause)']
-GRAMMAR_DICTIONARY["group_clause"] = ['(ws expr ws "," ws group_clause)', '(ws expr)']
+GRAMMAR_DICTIONARY["group_clause"] = ['(ws expr ws "," ws group_clause)', '(ws col_ref)']
 
 GRAMMAR_DICTIONARY["orderby_clause"] = ['ws "order" ws "by" ws order_clause']
 GRAMMAR_DICTIONARY["order_clause"] = ['(ordering_term ws "," ws order_clause)', 'ordering_term']
@@ -99,7 +99,7 @@ GRAMMAR_DICTIONARY["boolean"] = ['"true"', '"false"']
 # TODO(MARK): This is not tight enough. AND/OR are strictly boolean value operators.
 GRAMMAR_DICTIONARY["binaryop"] = ['"+"', '"-"', '"*"', '"/"', '"="', '"!="', '"<>"',
                                   '">="', '"<="', '">"', '"<"', '"and"', '"or"', '"like"']
-GRAMMAR_DICTIONARY["unaryop"] = ['"+"', '"-"', '"not"', '"not"']
+GRAMMAR_DICTIONARY["unaryop"] = ['"+"', '"-"', '"not"']
 
 
 def update_grammar_with_tables(grammar_dictionary: Dict[str, List[str]],

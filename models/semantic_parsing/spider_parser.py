@@ -3,6 +3,7 @@ import os
 from functools import partial
 from typing import Dict, List, Tuple, Any, Mapping, Sequence
 
+from pathlib import Path
 import sqlparse
 import torch
 from allennlp.common.util import pad_sequence_to_length
@@ -12,6 +13,8 @@ from allennlp.data.fields.production_rule_field import ProductionRule, Productio
 from allennlp.models import Model
 from allennlp.modules import TextFieldEmbedder, Seq2SeqEncoder, Seq2VecEncoder, Embedding, Attention, FeedForward, \
     TimeDistributed
+from allennlp.modules.matrix_attention import CosineMatrixAttention, DotProductMatrixAttention
+from allennlp.modules.attention import DotProductAttention
 from allennlp.modules.seq2vec_encoders import BagOfEmbeddingsEncoder
 from allennlp.nn import util, Activation
 from allennlp.state_machines import BeamSearch
@@ -45,8 +48,10 @@ class SpiderParser(SpiderBase):
                  question_embedder: TextFieldEmbedder,
                  input_attention: Attention,
                  past_attention: Attention,
+                 graph_attention: Attention,
                  max_decoding_steps: int,
                  action_embedding_dim: int,
+                 enable_gating: bool = False,
                  gnn: bool = True,
                  graph_loss_lambda: float = 0.5,
                  decoder_use_graph_entities: bool = True,
@@ -54,15 +59,18 @@ class SpiderParser(SpiderBase):
                  gnn_timesteps: int = 2,
                  pruning_gnn_timesteps: int = 2,
                  parse_sql_on_decoding: bool = True,
-                 add_action_bias: bool = True,
+                 add_action_bias: bool = False,
                  use_neighbor_similarity_for_linking: bool = True,
                  dataset_path: str = 'dataset',
+                 log_path: str = '',
                  training_beam_size: int = None,
                  decoder_num_layers: int = 1,
                  dropout: float = 0.0,
                  rule_namespace: str = 'rule_labels') -> None:
         super().__init__(vocab, encoder, entity_encoder, question_embedder, gnn_timesteps, dropout, rule_namespace)
 
+        self.enable_gating = enable_gating
+        self._log_path = log_path
         self._max_decoding_steps = max_decoding_steps
         self._add_action_bias = add_action_bias
 
@@ -90,9 +98,11 @@ class SpiderParser(SpiderBase):
         self._action_embedder = Embedding(num_embeddings=num_actions, embedding_dim=input_action_dim)
         self._output_action_embedder = Embedding(num_embeddings=num_actions, embedding_dim=action_embedding_dim)
 
-        encoder_output_dim = encoder.get_output_dim()
-        if gnn:
-            encoder_output_dim += action_embedding_dim
+        self._embedding_projector = torch.nn.Linear(question_embedder.get_output_dim(), self._embedding_dim, bias=False)
+        self._bert_embedding_dim = question_embedder.get_output_dim()
+        encoder_output_dim = self._encoder.get_output_dim() + self._embedding_dim
+
+        self._neighbor_encoder = TimeDistributed(BagOfEmbeddingsEncoder(self._embedding_dim, averaged=True))
 
         self._first_action_embedding = torch.nn.Parameter(torch.FloatTensor(action_embedding_dim))
         self._first_attended_utterance = torch.nn.Parameter(torch.FloatTensor(encoder_output_dim))
@@ -116,6 +126,7 @@ class SpiderParser(SpiderBase):
                                                                                 action_embedding_dim=action_embedding_dim,
                                                                                 input_attention=input_attention,
                                                                                 past_attention=past_attention,
+                                                                                enable_gating=self.enable_gating,
                                                                                 predict_start_type_separately=False,
                                                                                 add_action_bias=self._add_action_bias,
                                                                                 dropout=dropout,
@@ -129,7 +140,12 @@ class SpiderParser(SpiderBase):
                                                                   dropout=dropout,
                                                                   num_layers=self._decoder_num_layers)
 
-        self._ent2ent_ff = FeedForward(action_embedding_dim, 1, action_embedding_dim, Activation.by_name('relu')())
+        if self.enable_gating:
+            self._graph_attention = graph_attention
+        else:
+            self._graph_attention = DotProductAttention()
+
+        self._embedding_sim_attn = CosineMatrixAttention()
 
         # TODO: Remove hard-coded dirs
         self._evaluate_func = partial(evaluate,
@@ -143,6 +159,7 @@ class SpiderParser(SpiderBase):
                 valid_actions: List[List[ProductionRule]],
                 world: List[SpiderWorld],
                 schema: Dict[str, torch.LongTensor],
+                epoch_num: List[int]=None,
                 action_sequence: torch.LongTensor = None) -> Dict[str, torch.Tensor]:
 
         max_len_entities = max([len(w.db_context.knowledge_graph.entities) for w in world])
@@ -186,6 +203,8 @@ class SpiderParser(SpiderBase):
 
             loss += graph_loss
 
+        if epoch_num:
+            initial_state.extras = epoch_num[0]
         if self.training:
             try:
                 decode_output = self._decoder_trainer.decode(initial_state,
@@ -205,7 +224,7 @@ class SpiderParser(SpiderBase):
                                                               self._transition_function,
                                                               (action_sequence.unsqueeze(1),
                                                                action_mask.unsqueeze(1)))['loss']
-                    loss += query_loss
+                    loss += (1-self._graph_loss_lambda) * query_loss
                 except ZeroDivisionError:
                     pass
 
@@ -228,23 +247,82 @@ class SpiderParser(SpiderBase):
                                              world,
                                              action_sequence,
                                              outputs)
+            ep = 'eval'
+            if epoch_num:
+                ep = epoch_num[0]
+            self.debug_info(best_final_states, world, outputs['predicted_sql_query'], ep)
             return outputs
+
+    def debug_info(self, states, worlds, sql_predictions, epoch_num):
+        f = Path(f'{self._log_path}/epoch{epoch_num}-debug.log').open('a')
+        for i in range(len(states)):
+            if i not in states:
+                continue
+            s = states[i][0]
+            w = worlds[i]
+            f.write('\n'.join([w.db_context.utterance, w.db_context.db_id,
+                'GT: ' + ' '.join(w.query), 'PD: ' + sql_predictions[i]]))
+            f.write('\n\n')
+            for action, info in zip(s.action_history[0], s.debug_info[0]):
+                gate_info = ''
+                if self.enable_gating:
+                    gate = info['gate']
+                    if gate is not None:
+                        if isinstance(gate, tuple):
+                            gate, attn_past_pos, attn_past_w, transit_to = gate
+                            gate_info = ('g: %.3f' % gate[0].item()) + ' ' + str(attn_past_pos.item()) + ' g_attn_w: %.3f' % attn_past_w.item() \
+                                + (' cp: %.3f' % gate[1].item()) + (' sl: %.3f' % gate[2].item()) \
+                                + ' ' + str(w.db_context.knowledge_graph.entities[transit_to])
+                        else:
+                            gate_info = ('g: %.3f' % gate.item())
+                f.write(s.possible_actions[i][action][0] + ' ' + gate_info + '\n')
+            f.write('\n\n================================\n\n')
+        f.close()
 
     def _get_initial_state(self,
                            utterance: Dict[str, torch.LongTensor],
                            worlds: List[SpiderWorld],
                            schema: Dict[str, torch.LongTensor],
                            actions: List[List[ProductionRule]]) -> GrammarBasedState:
-        schema_text = schema['text']
-        embedded_schema = self._question_embedder(schema_text, num_wrapping_dims=1)
-        schema_mask = util.get_text_field_mask(schema_text, num_wrapping_dims=1).float()
+        device = utterance['tokens'].device
+        batch_size, num_entities, _, _ = schema['linking'].size()
+        num_entity_tokens = max([max(len(t) for t in world.db_context.entity_tokens) for world in worlds])
 
-        embedded_utterance = self._question_embedder(utterance)
-        utterance_mask = util.get_text_field_mask(utterance).float()
+        # Hack token ids:
+        # We have multiple chunks in an utterance but all the entity tokens chunks should have same type.
+        utterance['tokens-type-ids'][utterance['tokens-type-ids']>1]=1
+        utterance['tokens-offsets'] = torch.cat((utterance['tokens-offsets'].new_zeros((batch_size, 1)), utterance['tokens-offsets']), dim=-1)
 
-        batch_size, num_entities, num_entity_tokens, _ = embedded_schema.size()
-        num_entities = max([len(world.db_context.knowledge_graph.entities) for world in worlds])
-        num_question_tokens = utterance['tokens'].size(1)
+        u_lens = [len(world.db_context.tokenized_utterance) for world in worlds]
+        num_question_tokens = max(u_lens)
+
+        for i in range(0, batch_size):
+            for j, t in enumerate(utterance['tokens'][i]):
+                if t == 102:
+                    utterance['tokens-type-ids'][i,j] = 0
+
+        combined_embedding = self._question_embedder(utterance)
+        u_embeddings = []
+        u_e_embeddings = []
+        embedding_padding_fn = lambda:torch.zeros(self._bert_embedding_dim, device=device)
+        for i, world in enumerate(worlds):
+            u_len = u_lens[i]
+            u_embedding = combined_embedding[i][1:u_len+1]
+            u_embeddings.append(torch.cat([u_embedding, torch.zeros((num_question_tokens-u_len, self._bert_embedding_dim), device=device)]))
+
+            e_embeddings = []
+            pos = u_len + 2
+            for t in world.db_context.entity_tokens:
+                e_embeddings.append(torch.cat([combined_embedding[i][pos:pos+len(t)], 
+                    torch.zeros((num_entity_tokens-len(t), self._bert_embedding_dim), device=device)]))
+                pos += len(t) + 1
+            u_e_embeddings.append(torch.stack(pad_sequence_to_length(e_embeddings, desired_length=num_entities, 
+                default_value=lambda:torch.zeros((num_entity_tokens, self._bert_embedding_dim), device=device))))
+        
+        embedded_schema = torch.stack(u_e_embeddings)
+        schema_mask = (embedded_schema.sum(dim=-1) != 0).float()
+        embedded_utterance = torch.stack(u_embeddings)
+        utterance_mask = util.get_mask_from_sequence_lengths(torch.as_tensor(u_lens, device=device).long(), max_length=max(u_lens))
 
         # entity_types: tensor with shape (batch_size, num_entities), where each entry is the
         # entity's type id.
@@ -259,69 +337,28 @@ class SpiderParser(SpiderBase):
         # because this similarity is the main mechanism that the model can use to push apart logit
         # scores for certain actions (like "n -> 1" and "n -> -1"), this needs to have a larger
         # output range than [-1, 1].
-        question_entity_similarity = torch.bmm(embedded_schema.view(batch_size,
-                                                                    num_entities * num_entity_tokens,
-                                                                    self._embedding_dim),
-                                               torch.transpose(embedded_utterance, 1, 2))
+        embedded_schema = self._entity_encoder(embedded_schema, schema_mask)
 
-        question_entity_similarity = question_entity_similarity.view(batch_size,
-                                                                     num_entities,
-                                                                     num_entity_tokens,
-                                                                     num_question_tokens)
+        entity_question_similarity = self._embedding_sim_attn(embedded_schema, embedded_utterance)
+
+        feature_scores = self._linking_params(schema['linking']).squeeze(3)
+
         # (batch_size, num_entities, num_question_tokens)
-        question_entity_similarity_max_score, _ = torch.max(question_entity_similarity, 2)
-
-        # (batch_size, num_entities, num_question_tokens, num_features)
-        linking_features = schema['linking']
-
-        linking_scores = question_entity_similarity_max_score
-
-        feature_scores = self._linking_params(linking_features).squeeze(3)
-
-        linking_scores = linking_scores + feature_scores
+        linking_scores = entity_question_similarity * 10 + feature_scores
 
         # (batch_size, num_question_tokens, num_entities)
-        linking_probabilities = self._get_linking_probabilities(worlds, linking_scores.transpose(1, 2),
+        linking_prob_by_type = self._get_linking_probabilities(worlds, linking_scores.transpose(1, 2),
                                                                 utterance_mask, entity_type_dict)
 
-        # (batch_size, num_entities, num_neighbors) or None
-        neighbor_indices = self._get_neighbor_indices(worlds, num_entities, linking_scores.device)
-
-        if self._use_neighbor_similarity_for_linking and neighbor_indices is not None:
-            # (batch_size, num_entities, embedding_dim)
-            encoded_table = self._entity_encoder(embedded_schema, schema_mask)
-
-            # Neighbor_indices is padded with -1 since 0 is a potential neighbor index.
-            # Thus, the absolute value needs to be taken in the index_select, and 1 needs to
-            # be added for the mask since that method expects 0 for padding.
-            # (batch_size, num_entities, num_neighbors, embedding_dim)
-            embedded_neighbors = util.batched_index_select(encoded_table, torch.abs(neighbor_indices))
-
-            neighbor_mask = util.get_text_field_mask({'ignored': neighbor_indices + 1},
-                                                     num_wrapping_dims=1).float()
-
-            # Encoder initialized to easily obtain a masked average.
-            neighbor_encoder = TimeDistributed(BagOfEmbeddingsEncoder(self._embedding_dim, averaged=True))
-            # (batch_size, num_entities, embedding_dim)
-            embedded_neighbors = neighbor_encoder(embedded_neighbors, neighbor_mask)
-            projected_neighbor_embeddings = self._neighbor_params(embedded_neighbors.float())
-
-            # (batch_size, num_entities, embedding_dim)
-            entity_embeddings = torch.tanh(entity_type_embeddings + projected_neighbor_embeddings)
-        else:
-            # (batch_size, num_entities, embedding_dim)
-            entity_embeddings = torch.tanh(entity_type_embeddings)
-
-        link_embedding = util.weighted_sum(entity_embeddings, linking_probabilities)
-        encoder_input = torch.cat([link_embedding, embedded_utterance], 2)
+        entity_embeddings = entity_type_embeddings
 
         # (batch_size, utterance_length, encoder_output_dim)
-        encoder_outputs = self._dropout(self._encoder(encoder_input, utterance_mask))
+        encoder_outputs = self._dropout(self._encoder(embedded_utterance, utterance_mask))
 
         # compute the relevance of each entity with the relevance GNN
         ent_relevance, ent_relevance_logits, ent_to_qst_lnk_probs = self._graph_pruning(worlds,
                                                                                         encoder_outputs,
-                                                                                        entity_type_embeddings,
+                                                                                        entity_embeddings,
                                                                                         linking_scores,
                                                                                         utterance_mask,
                                                                                         self._get_graph_adj_lists)
@@ -329,13 +366,13 @@ class SpiderParser(SpiderBase):
         self.predicted_relevance_logits = ent_relevance_logits
 
         # multiply the embedding with the computed relevance
-        graph_initial_embedding = entity_type_embeddings * ent_relevance
+        graph_initial_embedding = entity_embeddings * ent_relevance
 
         encoder_output_dim = self._encoder.get_output_dim()
         if self._gnn:
             entities_graph_encoding = self._get_schema_graph_encoding(worlds,
                                                                       graph_initial_embedding)
-            graph_link_embedding = util.weighted_sum(entities_graph_encoding, linking_probabilities)
+            graph_link_embedding = util.weighted_sum(entities_graph_encoding, linking_prob_by_type)
             encoder_outputs = torch.cat((
                 encoder_outputs,
                 graph_link_embedding
@@ -345,16 +382,13 @@ class SpiderParser(SpiderBase):
             entities_graph_encoding = None
 
         if self._self_attend:
-            # linked_actions_linking_scores = self._get_linked_actions_linking_scores(actions, entities_graph_encoding)
-            entities_ff = self._ent2ent_ff(entities_graph_encoding)
-            linked_actions_linking_scores = torch.bmm(entities_ff, entities_ff.transpose(1, 2))
+            linked_actions_linking_scores = torch.stack([self._graph_attention(entities_graph_encoding[:,i],
+                entities_graph_encoding) for i in range(0, num_entities)]).transpose(0, 1)
         else:
             linked_actions_linking_scores = [None] * batch_size
 
         # This will be our initial hidden state and memory cell for the decoder LSTM.
-        final_encoder_output = util.get_final_encoder_states(encoder_outputs,
-                                                             utterance_mask,
-                                                             self._encoder.is_bidirectional())
+        final_encoder_output = encoder_outputs.new_zeros(batch_size, encoder_output_dim)
         memory_cell = encoder_outputs.new_zeros(batch_size, encoder_output_dim)
         initial_score = embedded_utterance.data.new_zeros(batch_size)
 
@@ -410,11 +444,7 @@ class SpiderParser(SpiderBase):
             action_map[action_string] = action_index
 
         valid_actions = world.valid_actions
-        entity_map = {}
-        entities = world.entities_names
-
-        for entity_index, entity in enumerate(entities):
-            entity_map[entity] = entity_index
+        entity_map = world.entities_names
 
         translated_valid_actions: Dict[str, Dict[str, Tuple[torch.Tensor, torch.Tensor, List[int]]]] = {}
         for key, action_strings in valid_actions.items():

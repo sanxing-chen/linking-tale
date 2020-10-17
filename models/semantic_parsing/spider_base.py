@@ -39,7 +39,7 @@ class SpiderBase(Model):
         self._acc_multi = Average()
 
         self._num_entity_types = 9
-        self._embedding_dim = question_embedder.get_output_dim()
+        self._embedding_dim = 200
 
         self._entity_type_encoder_embedding = Embedding(self._num_entity_types, self._embedding_dim)
 
@@ -47,8 +47,6 @@ class SpiderBase(Model):
         torch.nn.init.uniform_(self._linking_params.weight, 0, 1)
 
         self._gnn = GatedGraphConv(self._embedding_dim, gnn_timesteps, num_edge_types=3, dropout=dropout)
-
-        self._neighbor_params = torch.nn.Linear(self._embedding_dim, self._embedding_dim)
 
     @staticmethod
     def _get_neighbor_indices(worlds: List[SpiderWorld],

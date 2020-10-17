@@ -84,7 +84,8 @@ class GrammarBasedState(State['GrammarBasedState']):
                                    action_probabilities: List[float] = None,
                                    attention_weights: torch.Tensor = None,
                                    linking_scores_qst: torch.Tensor = None,
-                                   linking_scores_past: torch.Tensor = None) -> 'GrammarBasedState':
+                                   linking_scores_past: torch.Tensor = None,
+                                   gate: torch.Tensor = None) -> 'GrammarBasedState':
         batch_index = self.batch_indices[group_index]
         new_action_history = self.action_history[group_index] + [action]
         production_rule = self.possible_actions[batch_index][action][0]
@@ -99,6 +100,7 @@ class GrammarBasedState(State['GrammarBasedState']):
                     'probabilities': action_probabilities,
                     'linking_scores_qst': linking_scores_qst,
                     'linking_scores_past': linking_scores_past,
+                    'gate': gate,
                     }
             new_debug_info = [self.debug_info[group_index] + [debug_info]]
         else:

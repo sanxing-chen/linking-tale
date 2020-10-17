@@ -15,12 +15,22 @@ class SqlState:
         self.current_stack = []
         self.subqueries_stack = []
         self.enabled = enabled
+    
+    def deepcopy(self, obj):
+        new_obj = SqlState([], self.enabled)
+        new_obj.possible_actions = obj.possible_actions.copy()
+        new_obj.action_history = obj.action_history.copy()
+        new_obj.tables_used = obj.tables_used.copy()
+        new_obj.tables_used_by_columns = obj.tables_used_by_columns.copy()
+        new_obj.current_stack = copy.deepcopy(obj.current_stack)
+        new_obj.subqueries_stack = copy.deepcopy(obj.subqueries_stack)
+        return new_obj
 
     def take_action(self, production_rule: str) -> 'SqlState':
         if not self.enabled:
             return self
 
-        new_sql_state = copy.deepcopy(self)
+        new_sql_state = self.deepcopy(self)
 
         lhs, rhs = production_rule.split(' -> ')
         rhs_tokens = rhs.strip('[]').split(', ')
@@ -32,7 +42,7 @@ class SqlState:
             new_sql_state.tables_used_by_columns = set()
             new_sql_state.tables_used = set()
         elif lhs == "source_subq":
-            new_sql_state.subqueries_stack.append(copy.deepcopy(new_sql_state))
+            new_sql_state.subqueries_stack.append(self.deepcopy(new_sql_state))
             new_sql_state.tables_used = set()
             new_sql_state.tables_used_by_columns = set()
 

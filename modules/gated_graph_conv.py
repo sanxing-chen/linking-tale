@@ -73,7 +73,7 @@ class GatedGraphConv(MessagePassing):
                     continue
                 m = self.dropout(torch.matmul(h, self.weight[t, e]) + self.bias[t, e])
                 new_h.append(self.propagate(edge_indices[e], size=(x.size(0), x.size(0)), x=m))
-            m_sum = torch.sum(torch.stack(new_h), dim=0)
+            m_sum = torch.sum(torch.stack(new_h), dim=0) / self.num_edge_types
             h = self.rnn(m_sum, h)
 
         return h
