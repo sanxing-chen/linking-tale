@@ -23,6 +23,7 @@ class AttendPastSchemaItemsTransitionFunction(BasicTransitionFunction):
                  past_attention: Attention,
                  activation: Activation = Activation.by_name('relu')(),
                  enable_gating: bool = True, 
+                 ablation_mode: str = None,
                  predict_start_type_separately: bool = True,
                  num_start_types: int = None,
                  add_action_bias: bool = True,
@@ -37,15 +38,20 @@ class AttendPastSchemaItemsTransitionFunction(BasicTransitionFunction):
                          num_layers=num_layers)
 
         self.enable_gating = enable_gating
+        self.ablation_mode = ablation_mode
+
         self._decoder_dim = encoder_output_dim
         self._input_projection_layer = Linear(encoder_output_dim + action_embedding_dim, encoder_output_dim)
 
         if add_action_bias:
             action_embedding_dim = action_embedding_dim + 1
         self._past_attention = AdditiveAttention(action_embedding_dim, action_embedding_dim, True)
-        self._past_copy_attention = AdditiveAttention(action_embedding_dim, action_embedding_dim, False)
         self._action2gate = Linear(action_embedding_dim, 1)
-        self._action2copygate = Linear(action_embedding_dim, 1)
+        if self.ablation_mode != "wo_copy":
+            self._past_copy_attention = AdditiveAttention(action_embedding_dim, action_embedding_dim, False)
+            self._action2copygate = Linear(action_embedding_dim, 1)
+        if self.ablation_mode == "wo_reuse_emb":
+            self._output_projection_layer2 = Linear(encoder_output_dim * 2, action_embedding_dim)
         self._ent2ent_ff = FeedForward(1, 1, 1, Activation.by_name('linear')())
         self._large_dropout = Dropout(0.3)
 
@@ -124,7 +130,9 @@ class AttendPastSchemaItemsTransitionFunction(BasicTransitionFunction):
         # (group_size, action_embedding_dim)
         projected_query = self._activation(self._output_projection_layer(action_query))
         predicted_action_embeddings = self._dropout(projected_query)
-        predicted_type_embeddings = None
+        predicted_type_embeddings = (self._dropout(self._activation(self._output_projection_layer2(action_query)))
+            if self.ablation_mode == "wo_reuse_emb" else None)
+
         if self._add_action_bias:
             # NOTE: It's important that this happens right before the dot product with the action
             # embeddings.  Otherwise this isn't a proper bias.  We do it here instead of right next
@@ -139,8 +147,9 @@ class AttendPastSchemaItemsTransitionFunction(BasicTransitionFunction):
                 decoder_outputs_states, decoder_outputs_ids, prev_action_embeddings = rnn_state.decoder_outputs
                 attn_weights = self.attend(self._past_attention, predicted_action_embeddings[i].unsqueeze(0),
                                            prev_action_embeddings.unsqueeze(0), None).squeeze(0)
-                copy_attn_weights = self.attend(self._past_copy_attention, predicted_action_embeddings[i].unsqueeze(0),
+                copy_attn_weights = (self.attend(self._past_copy_attention, predicted_action_embeddings[i].unsqueeze(0),
                                            prev_action_embeddings.unsqueeze(0), None).squeeze(0)/5.0
+                                           if self.ablation_mode != "wo_copy" else None)
                 past_schema_items_attention_weights.append((attn_weights, copy_attn_weights, decoder_outputs_ids, decoder_outputs_states))
             else:
                 past_schema_items_attention_weights.append(None)
@@ -194,7 +203,8 @@ class AttendPastSchemaItemsTransitionFunction(BasicTransitionFunction):
                 action_embeddings, output_action_embeddings, embedded_actions = instance_actions['global']
                 # This is just a matrix product between a (num_actions, embedding_dim) matrix and an
                 # (embedding_dim, 1) matrix.
-                embedded_action_logits = action_embeddings.mm(predicted_action_embedding.unsqueeze(-1)).squeeze(-1)
+                embedded_action_logits = action_embeddings.mm((predicted_type_embeddings[group_index] 
+                    if self.ablation_mode == "wo_reuse_emb" else predicted_action_embedding).unsqueeze(-1)).squeeze(-1)
                 action_ids = embedded_actions
 
             if 'linked' in instance_actions:
@@ -220,15 +230,24 @@ class AttendPastSchemaItemsTransitionFunction(BasicTransitionFunction):
                         past_items_attention_weights.unsqueeze(-1)).squeeze(-1)
 
                     if self.enable_gating:
-                        copy_gate = self._action2copygate(predicted_action_embedding)
-                        copy_gate = torch.sigmoid(copy_gate)
-                        # if state.extras is not None and state.extras <= 3:
-                        #     copy_gate = torch.ones_like(copy_gate) * 0.5
-                        copy_weights = torch.stack([past_items_copy_weights[past_items_action_ids.index(i)]
-                            if i in past_items_action_ids
-                            else torch.zeros_like(past_items_copy_weights[0])
-                            for i in linked_actions])
-                        linked_action_ent2ent_logits = copy_gate * torch.softmax(copy_weights, dim=-1) + (1-copy_gate) * torch.softmax(linked_action_ent2ent_logits, dim=-1)
+                        if self.ablation_mode != "wo_copy":
+                            copy_gate = self._action2copygate(predicted_action_embedding)
+                            copy_gate = torch.sigmoid(copy_gate)
+                            # if state.extras is not None and state.extras <= 3:
+                            #     copy_gate = torch.ones_like(copy_gate) * 0.5
+                            copy_weights = torch.stack([past_items_copy_weights[past_items_action_ids.index(i)]
+                                if i in past_items_action_ids
+                                else torch.zeros_like(past_items_copy_weights[0])
+                                for i in linked_actions])
+                            linked_action_ent2ent_logits = (copy_gate * torch.softmax(copy_weights, dim=-1) 
+                                + (1-copy_gate) * torch.softmax(linked_action_ent2ent_logits, dim=-1))
+                            if self.ablation_mode != "ent_rem":
+                                linked_action_logits_encoder[[linked_actions.index(i) 
+                                    for i in past_items_action_ids 
+                                    if i in linked_actions]] = 0
+                        else:
+                            copy_gate = 0
+                            linked_action_ent2ent_logits = torch.softmax(linked_action_ent2ent_logits, dim=-1)
                     else:
                         linked_action_ent2ent_logits = self._ent2ent_ff(linked_action_ent2ent_logits.unsqueeze(-1)).squeeze(-1)
                 else:

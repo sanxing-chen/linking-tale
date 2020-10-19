@@ -5,7 +5,7 @@ The implementation is built on top of this [repository](https://github.com/benbo
 
 
 
-## Install & Configure
+## Installation
 
 1. Install pytorch version 1.5.0 that fits your CUDA version 
 
@@ -43,6 +43,11 @@ python run.py <path> --mode eval
 ```
 
 The predictions can be further evaluated by the official [evaluation scripts](https://github.com/taoyds/spider) of the Spider dataset.
+
+Ablations and alternative approach studies can be performed by the following command.
+```
+python run.py <path> --mode train --gated --ablation <study_name>
+```
 
 ## Debugging
 

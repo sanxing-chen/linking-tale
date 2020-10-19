@@ -52,6 +52,7 @@ class SpiderParser(SpiderBase):
                  max_decoding_steps: int,
                  action_embedding_dim: int,
                  enable_gating: bool = False,
+                 ablation_mode: str = None,
                  gnn: bool = True,
                  graph_loss_lambda: float = 0.5,
                  decoder_use_graph_entities: bool = True,
@@ -70,6 +71,7 @@ class SpiderParser(SpiderBase):
         super().__init__(vocab, encoder, entity_encoder, question_embedder, gnn_timesteps, dropout, rule_namespace)
 
         self.enable_gating = enable_gating
+        self.ablation_mode = ablation_mode
         self._log_path = log_path
         self._max_decoding_steps = max_decoding_steps
         self._add_action_bias = add_action_bias
@@ -127,6 +129,7 @@ class SpiderParser(SpiderBase):
                                                                                 input_attention=input_attention,
                                                                                 past_attention=past_attention,
                                                                                 enable_gating=self.enable_gating,
+                                                                                ablation_mode=self.ablation_mode,
                                                                                 predict_start_type_separately=False,
                                                                                 add_action_bias=self._add_action_bias,
                                                                                 dropout=dropout,
