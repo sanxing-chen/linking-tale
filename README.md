@@ -55,7 +55,7 @@ Refer to [AllenNLP](https://github.com/allenai/allennlp/blob/master/tutorials/ho
 
 ## BibTeX
 
-```tex
+```
 @inproceedings{chen2020tale,
     title={A Tale of Two Linkings: Dynamically Gating between Schema Linking and Structural Linking for Text-to-SQL Parsing},
     author={Sanxing Chen and Aidan San and Xiaodong Liu and Yangfeng Ji},
